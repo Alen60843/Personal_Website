@@ -85,14 +85,36 @@ export default function MetroHero({
     }
     video.addEventListener("loadeddata", onLoadedData)
 
-    // iOS Safari often won't buffer any video data until playback starts.
-    // Since we only ever seek, force a silent play-then-pause on mount.
-    const p = video.play()
-    if (p && typeof p.then === "function") {
-      p.then(() => video.pause()).catch(() => {})
-    } else {
-      video.pause()
+    // Smoothness: scrubbing a remote file means every seek waits on the
+    // network and the server's keyframes. So download the whole file once,
+    // then play it from a local blob URL where seeks are near-instant. If the
+    // download fails (for example no CORS), fall back to streaming the URL.
+    // iOS Safari also won't buffer anything until playback starts, so after
+    // setting the source we force a silent play-then-pause.
+    let objectUrl: string | null = null
+    let cancelled = false
+    const abort = new AbortController()
+    const attach = (src: string) => {
+      video.src = src
+      video.load()
+      const p = video.play()
+      if (p && typeof p.then === "function") {
+        p.then(() => video.pause()).catch(() => {})
+      }
     }
+    fetch(videoSrc, { signal: abort.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.blob()
+      })
+      .then((blob) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        attach(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) attach(videoSrc)
+      })
 
     const onSeeked = () => {
       isSeeking = false
@@ -175,7 +197,11 @@ export default function MetroHero({
     }
 
     const onWheel = (e: WheelEvent) => {
-      if (handleDelta(e.deltaY)) e.preventDefault()
+      // Normalise line/page wheel modes to pixels, and cap one tick so a
+      // single big mouse-wheel notch can't make the video jump.
+      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1
+      const delta = clamp(e.deltaY * unit, -140, 140)
+      if (handleDelta(delta)) e.preventDefault()
     }
 
     const onTouchStart = (e: TouchEvent) => {
@@ -205,8 +231,22 @@ export default function MetroHero({
     section.addEventListener("touchstart", onTouchStart, { passive: true, capture: true })
     section.addEventListener("touchmove", onTouchMove, { passive: false, capture: true })
 
-    function frame() {
-      currentProgress += (targetProgress - currentProgress) * 0.18
+    let lastTime = performance.now()
+    let lastDrawn = -1
+
+    function frame(now: number) {
+      // Frame-rate independent easing, so 60, 120 and 144 Hz screens feel the same.
+      const dt = Math.min(0.05, (now - lastTime) / 1000)
+      lastTime = now
+      currentProgress += (targetProgress - currentProgress) * (1 - Math.exp(-dt * 11))
+      if (Math.abs(targetProgress - currentProgress) < 0.0002) currentProgress = targetProgress
+
+      // Nothing moved since the last frame: skip the seek and all style writes.
+      if (currentProgress === lastDrawn) {
+        rafId = requestAnimationFrame(frame)
+        return
+      }
+      lastDrawn = currentProgress
 
       if (duration > 0) {
         seekTo(currentProgress * duration)
@@ -214,7 +254,7 @@ export default function MetroHero({
 
       if (videoRef.current) {
         const scale = 1 + currentProgress * 0.06
-        videoRef.current.style.transform = `scale(${scale})`
+        videoRef.current.style.transform = `translate3d(0,0,0) scale(${scale})`
       }
       if (titleRef.current) {
         const t = 1 - clamp(currentProgress / 0.35, 0, 1)
@@ -252,6 +292,9 @@ export default function MetroHero({
       section.removeEventListener("touchstart", onTouchStart, true)
       section.removeEventListener("touchmove", onTouchMove, true)
       cancelAnimationFrame(rafId)
+      cancelled = true
+      abort.abort()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
       releaseLock()
     }
   }, [scrubDistance])
@@ -272,7 +315,6 @@ export default function MetroHero({
     >
       <video
         ref={videoRef}
-        src={videoSrc}
         muted
         playsInline
         preload="auto"
@@ -381,7 +423,7 @@ export default function MetroHero({
           pointerEvents: "none",
         }}
       >
-        <span>{scrollHint}</span>
+        <span>{ready ? scrollHint : "LOADING"}</span>
         <svg width="14" height="18" viewBox="0 0 14 18" style={{ animation: "metro-hero-bounce 1.6s ease-in-out infinite" }}>
           <style>{`
             @keyframes metro-hero-bounce {

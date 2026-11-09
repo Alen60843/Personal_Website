@@ -65,6 +65,7 @@ export default function App() {
         title="ALEN FAER"
         tagline="From silicon to systems."
         scrollHint="SCROLL"
+        videoSrc="./hero.mp4"
         signature={false}
         scrubDistance={2600}
       />
